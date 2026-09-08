@@ -6,7 +6,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from precodahora import SearchConfig, collect_public_page, demo_prices, match_prices, optimize_cart, parse_cart
+from precodahora import SearchConfig, collect_public_page, demo_prices, geocode_location, match_prices, optimize_cart, parse_cart
 
 st.set_page_config(page_title="Cesta Bahia", page_icon="🛒", layout="wide", initial_sidebar_state="expanded")
 
@@ -55,10 +55,18 @@ with st.sidebar:
     strategy = st.selectbox("Como você quer comprar?", ["Equilibrada", "Menor preço por item", "Uma única loja"])
     st.divider()
     st.markdown("**Local de referência**")
-    city = st.text_input("Cidade", "Salvador")
-    lat = st.number_input("Latitude", value=-12.9714, format="%.4f")
-    lon = st.number_input("Longitude", value=-38.5014, format="%.4f")
-    st.caption("MVP: use coordenadas ou substitua esta etapa por geolocalização do navegador.")
+    address = st.text_input("Endereço ou CEP", "Pituba, Salvador - BA", help="A localização é pesquisada online no OpenStreetMap/Nominatim.")
+    if st.button("Buscar localização online", use_container_width=True):
+        with st.spinner("Localizando endereço..."):
+            found = geocode_location(address)
+        if found:
+            st.session_state.location = found
+            st.success(f"Local encontrado: {found[2]}")
+        else:
+            st.error("Não encontrei esse endereço. Tente informar rua, bairro, cidade e estado.")
+    default_location = st.session_state.get("location", (-12.9714, -38.5014, "Salvador - BA"))
+    lat, lon = default_location[0], default_location[1]
+    st.caption(f"Coordenadas usadas: {lat:.5f}, {lon:.5f}")
     st.divider()
     st.markdown("<span class='small-note'>Fonte: Preço da Hora Bahia · modo de demonstração disponível</span>", unsafe_allow_html=True)
 
@@ -81,8 +89,15 @@ with left:
             st.session_state.messages.append({"role": "assistant", "content": reply})
             st.rerun()
         with st.spinner("Consultando preços e montando combinações..."):
-            config = SearchConfig(lat, lon, radius, max_age, prompt)
-            live, source_message = collect_public_page(config)
+            live_parts = []
+            source_messages = []
+            for item in items:
+                config = SearchConfig(lat, lon, radius, max_age, item["nome"])
+                live_item, source_message = collect_public_page(config)
+                source_messages.append(source_message)
+                if not live_item.empty:
+                    live_parts.append(live_item)
+            live = pd.concat(live_parts, ignore_index=True) if live_parts else pd.DataFrame()
             using_demo = live.empty
             prices = demo_prices() if using_demo else live
             filtered = match_prices(prices, items, radius, max_age)
@@ -90,7 +105,7 @@ with left:
             result = optimize_cart(filtered, items, result_strategy)
             result["items"] = items
             result["using_demo"] = using_demo
-            result["source_message"] = source_message
+            result["source_message"] = " ".join(source_messages)
             st.session_state.last_result = result
         names = ", ".join(i["nome"] for i in items)
         mode = "dados de demonstração" if using_demo else "dados coletados"
@@ -136,3 +151,4 @@ if result:
             st.caption("O mapa aparecerá quando houver resultados.")
 
 st.markdown('<div style="text-align:center;color:#87968d;font-size:12px;margin-top:42px">Cesta Bahia · protótipo Streamlit · preços sujeitos a atualização e disponibilidade no estabelecimento</div>', unsafe_allow_html=True)
+
