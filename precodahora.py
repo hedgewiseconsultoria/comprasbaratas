@@ -124,6 +124,15 @@ def parse_cart(text: str) -> list[dict]:
     return items
 
 
+def resolve_cart_message(text: str, previous_user_message: str | None = None) -> tuple[str, list[dict]]:
+    """Resolve referências conversacionais simples antes de consultar a fonte."""
+    normalized = text.lower().strip()
+    references_previous = any(token in normalized for token in ("cada acima", "os itens acima", "a lista acima", "tudo acima"))
+    if references_previous and previous_user_message:
+        return previous_user_message, parse_cart(previous_user_message)
+    return text, parse_cart(text)
+
+
 def match_prices(df: pd.DataFrame, items: Iterable[dict], radius_km: float, max_age_hours: int) -> pd.DataFrame:
     if df.empty:
         return df
