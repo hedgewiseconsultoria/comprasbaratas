@@ -18,6 +18,11 @@ st.markdown("""
 .block-container { max-width:1220px; padding:1.6rem 2rem 4rem; }
 [data-testid="stSidebar"] { background:#143b2c; }
 [data-testid="stSidebar"] * { color:#f4fbf6 !important; }
+[data-testid="stSidebar"] input { color:#18251f !important; background:#ffffff !important; caret-color:#147a58 !important; }
+[data-testid="stSidebar"] input::placeholder { color:#68756e !important; }
+[data-testid="stSidebar"] div[data-baseweb="select"] > div { background:#ffffff !important; border-color:#ffffff !important; }
+[data-testid="stSidebar"] div[data-baseweb="select"] * { color:#18251f !important; }
+[data-testid="stSidebar"] div[data-baseweb="slider"] div[role="slider"] { background:#f3c969 !important; border-color:#f3c969 !important; }
 .brand { display:flex; align-items:center; gap:12px; margin-bottom:24px; }
 .logo { width:42px;height:42px;border-radius:14px;background:#f3c969;color:#143b2c;display:flex;align-items:center;justify-content:center;font-size:22px; }
 .brand-title { font-size:21px;font-weight:700;line-height:1; }
@@ -52,10 +57,12 @@ with st.sidebar:
     st.markdown("### Preferências")
     radius = st.slider("Raio de busca (km)", 1, 30, 8)
     max_age = st.slider("Preço emitido há até (horas)", 1, 72, 24)
-    strategy = st.selectbox("Como você quer comprar?", ["Equilibrada", "Menor preço por item", "Uma única loja"])
+    strategy = st.selectbox("Como você quer comprar?", ["Equilibrada", "Menor preço por item", "Uma única loja"], index=0)
+    st.caption(f"Estratégia atual: {strategy}")
     st.divider()
     st.markdown("**Local de referência**")
     address = st.text_input("Endereço ou CEP", "Pituba, Salvador - BA", help="A localização é pesquisada online no OpenStreetMap/Nominatim.")
+    st.caption(f"Local informado: {address or 'não informado'}")
     if st.button("Buscar localização online", use_container_width=True):
         with st.spinner("Localizando endereço..."):
             found = geocode_location(address)
@@ -68,7 +75,7 @@ with st.sidebar:
     lat, lon = default_location[0], default_location[1]
     st.caption(f"Coordenadas usadas: {lat:.5f}, {lon:.5f}")
     st.divider()
-    st.markdown("<span class='small-note'>Fonte: Preço da Hora Bahia · modo de demonstração disponível</span>", unsafe_allow_html=True)
+    st.markdown("<span class='small-note'>Fonte: Preço da Hora Bahia · consulta online em tempo real</span>", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="kicker">assistente de compras da Bahia</div><h1>Sua lista. O melhor caminho para economizar.</h1><p>Escreva sua cesta como falaria com uma pessoa. Nós organizamos os itens e comparamos as melhores combinações por perto.</p></div>', unsafe_allow_html=True)
 
@@ -93,7 +100,7 @@ with left:
             live_parts = []
             source_messages = []
             for item in items:
-                config = SearchConfig(lat, lon, radius, max_age, item["nome"])
+                config = SearchConfig(lat, lon, radius, max_age, item["busca"], item.get("volume"), item.get("unidade"))
                 live_item, source_message = collect_public_page(config)
                 source_messages.append(source_message)
                 if not live_item.empty:
@@ -108,7 +115,7 @@ with left:
             result["using_demo"] = using_demo
             result["source_message"] = " ".join(source_messages)
             st.session_state.last_result = result
-        names = ", ".join(i["nome"] for i in items)
+        names = ", ".join(f"{i['quantidade']}× {i['nome']}" for i in items)
         reply = f"Interpretei sua cesta como {names}. Consultei a fonte real para esses itens, em até {radius} km, priorizando {strategy.lower()}."
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
