@@ -6,7 +6,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from precodahora import SearchConfig, collect_public_page, demo_prices, geocode_location, match_prices, optimize_cart, parse_cart
+from precodahora import SearchConfig, collect_public_page, geocode_location, match_prices, optimize_cart, resolve_cart_message
 
 st.set_page_config(page_title="Cesta Bahia", page_icon="🛒", layout="wide", initial_sidebar_state="expanded")
 
@@ -83,7 +83,8 @@ with left:
     st.markdown('</div>', unsafe_allow_html=True)
     if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
-        items = parse_cart(prompt)
+        previous_user = next((m["content"] for m in reversed(st.session_state.messages[:-1]) if m["role"] == "user"), None)
+        resolved_prompt, items = resolve_cart_message(prompt, previous_user)
         if not items:
             reply = "Não consegui identificar produtos. Tente separar os itens por vírgulas, por exemplo: arroz 5 kg, feijão 1 kg e café 500 g."
             st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -98,8 +99,8 @@ with left:
                 if not live_item.empty:
                     live_parts.append(live_item)
             live = pd.concat(live_parts, ignore_index=True) if live_parts else pd.DataFrame()
-            using_demo = live.empty
-            prices = demo_prices() if using_demo else live
+            using_demo = False
+            prices = live
             filtered = match_prices(prices, items, radius, max_age)
             result_strategy = "Menor preço por item" if strategy == "Menor preço por item" else strategy
             result = optimize_cart(filtered, items, result_strategy)
@@ -108,8 +109,7 @@ with left:
             result["source_message"] = " ".join(source_messages)
             st.session_state.last_result = result
         names = ", ".join(i["nome"] for i in items)
-        mode = "dados de demonstração" if using_demo else "dados coletados"
-        reply = f"Encontrei {len(items)} itens ({names}). Preparei uma recomendação usando {mode}, em até {radius} km, priorizando {strategy.lower()}."
+        reply = f"Interpretei sua cesta como {names}. Consultei a fonte real para esses itens, em até {radius} km, priorizando {strategy.lower()}."
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -125,8 +125,8 @@ with right:
 result = st.session_state.last_result
 if result:
     st.markdown("## Sua recomendação")
-    if result["using_demo"]:
-        st.info("A fonte pública usa uma consulta dinâmica. Este resultado está no modo demonstração para o app funcionar no Streamlit Cloud; o adaptador de coleta está preparado em `precodahora.py`.")
+    if result["source_message"] and result["linhas"].empty:
+        st.error("A fonte real não retornou dados para esta consulta. " + result["source_message"])
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total estimado", f"R$ {result['total']:.2f}".replace('.', ','))
     m2.metric("Itens encontrados", f"{result['cobertura']}/{len(result['items'])}")
@@ -151,4 +151,3 @@ if result:
             st.caption("O mapa aparecerá quando houver resultados.")
 
 st.markdown('<div style="text-align:center;color:#87968d;font-size:12px;margin-top:42px">Cesta Bahia · protótipo Streamlit · preços sujeitos a atualização e disponibilidade no estabelecimento</div>', unsafe_allow_html=True)
-
