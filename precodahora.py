@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -8,8 +9,30 @@ from typing import Iterable
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from geopy.geocoders import Nominatim
 
 SOURCE_URL = "https://precodahora.ba.gov.br/"
+
+
+def geocode_location(address: str) -> tuple[float, float, str] | None:
+    """Obtém coordenadas online para um endereço no Brasil.
+
+    Usa o Nominatim/OpenStreetMap com identificação explícita do aplicativo.
+    Retorna latitude, longitude e nome formatado; em caso de falha retorna None.
+    """
+    query = address.strip()
+    if not query:
+        return None
+    if "brasil" not in query.lower() and "bahia" not in query.lower():
+        query = f"{query}, Bahia, Brasil"
+    try:
+        geolocator = Nominatim(user_agent="cesta-bahia-streamlit/0.1")
+        location = geolocator.geocode(query, exactly_one=True, timeout=10)
+        if not location:
+            return None
+        return float(location.latitude), float(location.longitude), location.address
+    except Exception:
+        return None
 
 
 @dataclass
@@ -46,26 +69,39 @@ def demo_prices() -> pd.DataFrame:
 
 
 def collect_public_page(config: SearchConfig, timeout: int = 12) -> tuple[pd.DataFrame, str]:
-    """Coleta conservadora da página pública; retorna vazio quando não há dados estruturados.
-
-    A busca do portal é dinâmica. Este adaptador é intencionalmente seguro: não contorna captcha,
-    não faz varredura massiva e deixa o app operar com dados demonstrativos enquanto o parser
-    específico do fluxo de resultados é validado.
-    """
+    """Consulta os endpoints públicos usados pela página e normaliza os resultados reais."""
     try:
-        response = requests.get(SOURCE_URL, timeout=timeout, headers={"User-Agent": "CestaBahia/0.1 (consulta manual)"})
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; CestaBahia/0.1)", "Accept": "application/json, text/plain, */*"})
+        response = session.get(SOURCE_URL, timeout=timeout)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        text = soup.get_text(" ", strip=True).lower()
-        if "captcha" in text or "robô" in text:
+        token_node = soup.select_one("#validate")
+        if not token_node:
+            return pd.DataFrame(), "Não foi possível iniciar a sessão da fonte."
+        headers = {"X-CSRFToken": token_node.get("data-id", ""), "Referer": SOURCE_URL, "X-Requested-With": "XMLHttpRequest"}
+        suggestion = session.post(SOURCE_URL.rstrip("/") + "/sugestao/", data={"item": config.query}, headers=headers, timeout=timeout)
+        if suggestion.status_code in (403, 429) or "captcha" in suggestion.text.lower():
             return pd.DataFrame(), "A fonte solicitou verificação humana."
-        # A página inicial não contém os preços: eles são carregados em uma rota dinâmica.
-        # Mantemos o resultado vazio até o adaptador de resultados ser configurado.
-        if config.query.lower() not in text and len(text) < 100:
-            return pd.DataFrame(), "A página não retornou resultados estruturados."
-        return pd.DataFrame(), "A consulta dinâmica não expôs dados estruturados nesta etapa."
+        suggestions = suggestion.json().get("resultado", [])
+        if not suggestions:
+            return pd.DataFrame(), "Nenhum produto correspondente foi sugerido."
+        gtin = str(suggestions[0].get("gtin", ""))
+        params = {"gtin": gtin, "horas": str(config.max_age_hours), "latitude": str(config.latitude), "longitude": str(config.longitude), "raio": str(config.radius_km), "precomax": "0", "precomin": "0", "ordenar": "preco.asc", "pagina": "1", "processo": "carregar", "totalRegistros": "0", "totalPaginas": "0", "pageview": "lista"}
+        prices = session.post(SOURCE_URL.rstrip("/") + "/produtos/", data=params, headers=headers, timeout=timeout)
+        if prices.status_code in (403, 429) or "captcha" in prices.text.lower():
+            return pd.DataFrame(), "A fonte solicitou verificação humana."
+        payload = prices.json()
+        rows = []
+        for record in payload.get("resultado", []):
+            product = record.get("produto", {})
+            shop = record.get("estabelecimento", {})
+            rows.append({"produto": product.get("descricao", config.query), "gtin": str(product.get("gtin", gtin)), "estabelecimento": shop.get("nomeEstabelecimento", "Não informado"), "endereco": f"{shop.get('endLogradouro', '')}, {shop.get('endNumero', '')}".strip(", "), "latitude": shop.get("latitude"), "longitude": shop.get("longitude"), "preco": float(product.get("precoLiquido") or product.get("precoUnitario") or 0), "distancia_km": float(shop.get("distancia") or 0), "idade_horas": max(0, int(product.get("timeSpan", 0) / 3600)), "coletado_em": datetime.now(), "data_nf": product.get("data"), "fonte": "Preço da Hora Bahia"})
+        return pd.DataFrame(rows), f"{len(rows)} preços reais coletados para {suggestions[0].get('descricao', config.query)}."
     except requests.RequestException as exc:
         return pd.DataFrame(), f"Fonte indisponível: {exc.__class__.__name__}."
+    except (ValueError, KeyError) as exc:
+        return pd.DataFrame(), f"Resposta inesperada da fonte: {exc.__class__.__name__}."
 
 
 def normalize_term(term: str) -> str:
