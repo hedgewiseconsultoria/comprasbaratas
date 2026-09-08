@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -42,6 +43,8 @@ class SearchConfig:
     radius_km: float
     max_age_hours: int
     query: str
+    volume: float | None = None
+    unidade: str | None = None
 
 
 def demo_prices() -> pd.DataFrame:
@@ -86,7 +89,13 @@ def collect_public_page(config: SearchConfig, timeout: int = 12) -> tuple[pd.Dat
         suggestions = suggestion.json().get("resultado", [])
         if not suggestions:
             return pd.DataFrame(), "Nenhum produto correspondente foi sugerido."
-        gtin = str(suggestions[0].get("gtin", ""))
+        query_tokens = set(re.findall(r"[a-z0-9]+", normalize_term(config.query)))
+        def suggestion_score(item: dict) -> int:
+            description_tokens = set(re.findall(r"[a-z0-9]+", normalize_term(str(item.get("descricao", "")))))
+            return len(query_tokens & description_tokens)
+        ranked = sorted(suggestions, key=suggestion_score, reverse=True)
+        selected = ranked[0]
+        gtin = str(selected.get("gtin", ""))
         params = {"gtin": gtin, "horas": str(config.max_age_hours), "latitude": str(config.latitude), "longitude": str(config.longitude), "raio": str(config.radius_km), "precomax": "0", "precomin": "0", "ordenar": "preco.asc", "pagina": "1", "processo": "carregar", "totalRegistros": "0", "totalPaginas": "0", "pageview": "lista"}
         prices = session.post(SOURCE_URL.rstrip("/") + "/produtos/", data=params, headers=headers, timeout=timeout)
         if prices.status_code in (403, 429) or "captcha" in prices.text.lower():
@@ -96,8 +105,15 @@ def collect_public_page(config: SearchConfig, timeout: int = 12) -> tuple[pd.Dat
         for record in payload.get("resultado", []):
             product = record.get("produto", {})
             shop = record.get("estabelecimento", {})
-            rows.append({"produto": product.get("descricao", config.query), "gtin": str(product.get("gtin", gtin)), "estabelecimento": shop.get("nomeEstabelecimento", "Não informado"), "endereco": f"{shop.get('endLogradouro', '')}, {shop.get('endNumero', '')}".strip(", "), "latitude": shop.get("latitude"), "longitude": shop.get("longitude"), "preco": float(product.get("precoLiquido") or product.get("precoUnitario") or 0), "distancia_km": float(shop.get("distancia") or 0), "idade_horas": max(0, int(product.get("timeSpan", 0) / 3600)), "coletado_em": datetime.now(), "data_nf": product.get("data"), "fonte": "Preço da Hora Bahia"})
-        return pd.DataFrame(rows), f"{len(rows)} preços reais coletados para {suggestions[0].get('descricao', config.query)}."
+            description = product.get("descricao", config.query)
+            product_volume = re.search(r"(\d+(?:[.,]\d+)?)\s*(KG|G|L|ML)\b", str(description).upper())
+            same_pack = True
+            if config.volume is not None and product_volume:
+                found_volume = float(product_volume.group(1).replace(",", "."))
+                found_unit = product_volume.group(2).lower()
+                same_pack = found_unit == (config.unidade or "").lower() and abs(found_volume - config.volume) < 0.01
+            rows.append({"produto": description, "gtin": str(product.get("gtin", gtin)), "estabelecimento": shop.get("nomeEstabelecimento", "Não informado"), "endereco": f"{shop.get('endLogradouro', '')}, {shop.get('endNumero', '')}".strip(", "), "latitude": shop.get("latitude"), "longitude": shop.get("longitude"), "preco": float(product.get("precoLiquido") or product.get("precoUnitario") or 0), "distancia_km": float(shop.get("distancia") or 0), "idade_horas": max(0, int(product.get("timeSpan", 0) / 3600)), "coletado_em": datetime.now(), "data_nf": product.get("data"), "fonte": "Preço da Hora Bahia", "embalagem_compativel": same_pack})
+        return pd.DataFrame(rows), f"{len(rows)} preços reais coletados para {selected.get('descricao', config.query)}."
     except requests.RequestException as exc:
         return pd.DataFrame(), f"Fonte indisponível: {exc.__class__.__name__}."
     except (ValueError, KeyError) as exc:
@@ -105,9 +121,37 @@ def collect_public_page(config: SearchConfig, timeout: int = 12) -> tuple[pd.Dat
 
 
 def normalize_term(term: str) -> str:
-    term = term.lower().strip()
+    term = unicodedata.normalize("NFKD", term.lower()).encode("ascii", "ignore").decode()
+    term = term.strip()
     term = re.sub(r"\b(kg|quilo|quilos|g|gramas|l|litro|ml)\b", "", term)
     return re.sub(r"\s+", " ", term).strip()
+
+
+def clean_product_name(name: str) -> str:
+    """Remove embalagem e conectivos, preservando o nome pesquisável do produto."""
+    value = name.lower().strip()
+    value = re.sub(r"\b(latas?|garrafas?|garrafão|pacotes?|caixas?|bandejas?|unidades?|und|litro|litros|quilo|quilos)\b", " ", value)
+    value = re.sub(r"\b\d+(?:[.,]\d+)?\s*(kg|quilo|quilos|g|gramas|l|litro|litros|ml|un|unid)\b", " ", value)
+    value = re.sub(r"\b(de|do|da|dos|das|com|cada)\b", " ", value)
+    return re.sub(r"\s+", " ", value).strip(" ,.-")
+
+
+def parse_quantity_and_specs(raw: str) -> dict:
+    """Extrai quantidade e embalagem sem destruir o texto usado na busca."""
+    text = raw.strip().lower()
+    qty_match = re.match(r"\s*(\d+(?:[.,]\d+)?)\s*(?:x|unidades?|unid\.?|un\.?|latas?|garrafas?|pacotes?|caixas?)?\s*(.*)", text)
+    quantity = float(qty_match.group(1).replace(",", ".")) if qty_match else 1.0
+    remainder = qty_match.group(2).strip() if qty_match else text
+    spec = re.search(r"(\d+(?:[.,]\d+)?)\s*(kg|g|l|ml|un|unid)", remainder)
+    volume = float(spec.group(1).replace(",", ".")) if spec else None
+    unit = spec.group(2) if spec else None
+    if spec is None:
+        spelled = re.search(r"(\d+(?:[.,]\d+)?)?\s*(litro|litros|quilo|quilos)", remainder)
+        if spelled:
+            volume = float((spelled.group(1) or "1").replace(",", "."))
+            unit = "l" if spelled.group(2).startswith("litro") else "kg"
+    search_name = clean_product_name(remainder)
+    return {"nome": search_name, "busca": search_name, "quantidade": quantity, "volume": volume, "unidade": unit, "texto_original": raw.strip()}
 
 
 def parse_cart(text: str) -> list[dict]:
@@ -116,11 +160,11 @@ def parse_cart(text: str) -> list[dict]:
     parts = [p.strip(" .") for p in re.split(r",|\n|\be\b", cleaned, flags=re.I) if p.strip()]
     items = []
     for part in parts:
-        match = re.match(r"(?:(\d+)\s*[x×]\s*|(?:(\d+)\s+))?(.*)", part, flags=re.I)
-        qty = int(match.group(1) or match.group(2) or 1)
-        name = match.group(3).strip()
-        if len(name) >= 2:
-            items.append({"nome": name, "quantidade": qty})
+        item = parse_quantity_and_specs(part)
+        if len(item["nome"]) >= 2:
+            if item["quantidade"].is_integer():
+                item["quantidade"] = int(item["quantidade"])
+            items.append(item)
     return items
 
 
@@ -160,7 +204,8 @@ def optimize_cart(df: pd.DataFrame, items: list[dict], strategy: str) -> dict:
         found = work[work["produto"].str.lower().apply(lambda x: sum(t in x for t in tokens) >= max(1, min(2, len(tokens))))]
         if found.empty:
             continue
-        candidates.append(found.sort_values("preco").iloc[0].to_dict() if strategy == "Menor preço por item" else found.iloc[0].to_dict())
+        found = found.sort_values(["embalagem_compativel", "preco"], ascending=[False, True])
+        candidates.append(found.iloc[0].to_dict())
     result = pd.DataFrame(candidates)
     if result.empty:
         return {"linhas": result, "total": 0.0, "lojas": [], "cobertura": 0, "mensagem": "Não foi possível associar os itens."}
